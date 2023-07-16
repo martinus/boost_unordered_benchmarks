@@ -12,6 +12,9 @@
 #include <chrono>
 #include <numeric>
 
+#define ANKERL_NANOBENCH_IMPLEMENT
+#include "nanobench.h"
+
 std::chrono::high_resolution_clock::time_point measure_start,measure_pause;
 
 template<typename F>
@@ -59,18 +62,26 @@ void resume_timing()
 #include <random>
 #include <thread>
 #include <vector>
+#if HAS_GTL
 #include "gtl/phmap.hpp"
+#endif
+#if HAS_TBB
 #include "oneapi/tbb/concurrent_hash_map.h"
+#endif
 #include "zipfian_int_distribution.h"
 
 using boost_map=boost::concurrent_flat_map<int,int>;
 
+#if HAS_TBB
 using tbb_map=tbb::concurrent_hash_map<int,int>;
+#endif
 
+#if HAS_GTL
 using gtl_map=gtl::parallel_flat_hash_map<
   int,int,gtl::priv::hash_default_hash<int>,gtl::priv::hash_default_eq<int>,
   std::allocator<std::pair<const int,int>>,
   8,std::mutex>;
+#endif
 
 template<typename... Args>
 inline void map_update(boost_map& m,Args&&... args)
@@ -84,6 +95,7 @@ inline bool map_find(const boost_map& m,const Key& x)
   return m.contains(x);
 }
 
+#if HAS_TBB
 template<typename... Args>
 inline void map_update(tbb_map& m,Args&&... args)
 {
@@ -96,7 +108,9 @@ inline bool map_find(const tbb_map& m,const Key& x)
 {
   return m.count(x);
 }
+#endif
 
+#if HAS_GTL
 template<typename Key,typename... Args>
 inline void map_update(gtl_map& m,Key&& k,Args&&... args)
 {
@@ -112,6 +126,7 @@ inline bool map_find(const gtl_map& m,const Key& x)
 {
   return m.contains(x);
 }
+#endif
 
 template<typename Distribution>
 class updater
@@ -147,6 +162,48 @@ private:
   Distribution dist;
 };
 
+template<size_t N>
+class SimpleDiscreteDistribution {
+public:
+  // N-1 because we don't store the last probability
+  std::array<uint64_t, N> m_cummulative{};
+
+public:
+  SimpleDiscreteDistribution(std::initializer_list<double> l) {
+    std::array<double, N> sums{};
+    double sum = 0.0;
+
+    auto i = 0;
+    for (auto x : l) {
+      sum += x;
+      sums[i] = sum;
+      ++i;
+    }
+
+    // normalize to 2^64
+    for (int i=0; i<N; ++i) {
+      m_cummulative[i] = static_cast<uint64_t>(sums[i]/sum * (double)std::numeric_limits<uint64_t>::max());
+    }
+    m_cummulative.back() = std::numeric_limits<uint64_t>::max();
+  }
+
+  auto operator()(uint64_t r01) const noexcept -> size_t {
+    for (size_t i=0; i<m_cummulative.size(); ++i) {
+      if (r01 <= m_cummulative[i]) {
+        return i;
+      }
+    }
+    return m_cummulative.size() - 1;
+  }
+
+  template<typename URNG>
+  auto operator()(URNG& rng) const noexcept -> size_t {
+    static_assert(URNG::min() == 0);
+    static_assert(URNG::max() == std::numeric_limits<uint64_t>::max());
+    return operator()(rng());
+  }
+};
+
 template<typename Map>
 struct parallel_load
 {
@@ -168,9 +225,13 @@ struct parallel_load
                                     finish(1);
 
       for(int i=0;i<num_threads;++i)threads.emplace_back([&,i,zipf1,zipf2]{
+#if 1
+        SimpleDiscreteDistribution<3> dist({10,45, 45});
+        ankerl::nanobench::Rng gen(std::size_t(282472+i*213731));
+#else
         std::discrete_distribution<>  dist({10,45,45});
         std::mt19937_64               gen(std::size_t(282472+i*213731));
-
+#endif
         updater  update{zipf1};
         finder   successful_find{zipf1},
                  unsuccessful_find{zipf2};
@@ -212,7 +273,13 @@ struct parallel_load
 
 template<
   template<typename> class Tester,
-  typename Container1,typename Container2,typename Container3
+#if HAS_TBB
+  typename Container1,
+#endif
+#if HAS_GTL
+  typename Container2,
+#endif
+  typename Container3
 >
 BOOST_NOINLINE void test(
   const char* title,int N,double theta,
@@ -228,11 +295,16 @@ BOOST_NOINLINE void test(
   std::cout<<"#threads;"<<name1<<";"<<name2<<";"<<name3<<std::endl;
 
   for(int n=1;n<=num_threads;++n){
+    double t;
     std::cout<<n<<";";
-    auto t=measure(boost::bind(Tester<Container1>(),N,theta,n));
+#if HAS_TBB
+    t=measure(boost::bind(Tester<Container1>(),N,theta,n));
     std::cout<<10*N/t/1E6<<";";
+#endif
+#if HAS_GTL
     t=measure(boost::bind(Tester<Container2>(),N,theta,n));
     std::cout<<10*N/t/1E6<<";";
+#endif
     t=measure(boost::bind(Tester<Container3>(),N,theta,n));
     std::cout<<10*N/t/1E6<<std::endl;
   }
@@ -246,8 +318,12 @@ int main()
     for(auto theta:{0.01,0.5,0.99}){
       test<
         parallel_load,
+#if HAS_TBB
         tbb_map,
+#endif
+#if HAS_GTL
         gtl_map,
+#endif
         boost_map>
       (
         "Parallel load",N,theta,

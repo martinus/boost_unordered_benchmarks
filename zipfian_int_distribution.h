@@ -70,6 +70,7 @@
 #include <limits>
 #include <random>
 #include <cassert>
+#include <cstring>
 
 template<typename _IntType = int>
 class zipfian_int_distribution
@@ -223,10 +224,25 @@ public:
   result_type operator()(_UniformRandomNumberGenerator& __urng)
   { return this->operator()(__urng, _M_param); }
 
+  double uniform01(uint64_t r) {
+    auto i = (UINT64_C(0x3ff) << 52U) | (r >> 12U);
+    // can't use union in c++ here for type puning, it's undefined behavior.
+    // std::memcpy is optimized anyways.
+    double d{};
+    std::memcpy(&d, &i, sizeof(double));
+    return d - 1.0;    
+  }
+
   template<typename _UniformRandomNumberGenerator>
   result_type operator()(_UniformRandomNumberGenerator& __urng, const param_type& __p)
   {
+#if 0
+    // This one is reaaaally slow with clang++
     double u = std::generate_canonical<double, std::numeric_limits<double>::digits, _UniformRandomNumberGenerator>(__urng);
+#else
+    double u = uniform01(__urng());
+#endif
+    
       
     double uz = u * __p.zeta();
     if(uz < 1.0) return __p.a();
